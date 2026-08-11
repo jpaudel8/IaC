@@ -1,4 +1,4 @@
-name: Deploy Infrastructure and Site
+name: Deploy Infrastructure
 
 on:
   push:
@@ -7,8 +7,6 @@ on:
 jobs:
   deploy-infra:
     runs-on: ubuntu-latest
-    outputs:
-      public_ip: ${{ steps.get-ip.outputs.ip }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,43 +18,65 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: us-east-1
 
+      - name: Look up default VPC and subnets
+        id: vpc-lookup
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=is-default,Values=true" \
+            --query "Vpcs[0].VpcId" --output text --region us-east-1)
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "Subnets[].SubnetId" --output text --region us-east-1 | tr '\t' ',')
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+          echo "subnet_ids=$SUBNET_IDS" >> "$GITHUB_OUTPUT"
+
       - name: Deploy stack
         run: |
           aws cloudformation deploy \
             --template-file infrastructure/web-server.yaml \
             --stack-name my-web-server-${{ github.ref_name }} \
-            --parameter-overrides KeyName=student-key \
+            --parameter-overrides \
+              KeyName=student-key \
+              EnvironmentName=${{ github.ref_name }} \
+              VpcId=${{ steps.vpc-lookup.outputs.vpc_id }} \
+              Subnets=${{ steps.vpc-lookup.outputs.subnet_ids }} \
+              GitHubUser=jpaudel8 \
+              GitHubRepo=IaC \
             --region us-east-1 \
             --no-fail-on-empty-changeset
 
-      - name: Get public IP
-        id: get-ip
-        run: |
-          IP=$(aws cloudformation describe-stacks \
-            --stack-name my-web-server-${{ github.ref_name }} \
-            --query "Stacks[0].Outputs[0].OutputValue" \
-            --output text \
-            --region us-east-1)
-          echo "Public IP: $IP"
-          echo "ip=$IP" >> "$GITHUB_OUTPUT"
-
-  deploy-site:
-    needs: deploy-infra
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Save SSH key
+      - name: Push latest code to all running instances
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Copy site files (retries until the new server is ready)
-        run: |
-          for i in {1..15}; do
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ github.ref_name }}-asg \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --output text \
+            --region us-east-1)
+
+          for ID in $INSTANCE_IDS; do
+            IP=$(aws ec2 describe-instances \
+              --instance-ids "$ID" \
+              --query "Reservations[0].Instances[0].PublicIpAddress" \
+              --output text \
+              --region us-east-1)
+            echo "Pushing to $ID ($IP)..."
+
             scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i key.pem \
-              index.html style.css script.js \
-              ec2-user@${{ needs.deploy-infra.outputs.public_ip }}:/usr/share/nginx/html/ && break
-            echo "Server not ready yet, retrying in 10s..."
-            sleep 10
+              index.html \
+              ec2-user@"$IP":/usr/share/nginx/html/ \
+            && ssh -o StrictHostKeyChecking=no -i key.pem ec2-user@"$IP" \
+              'TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"); LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4); AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone); sed -i "s/%%EC2_IP%%/$LOCAL_IP/g; s/%%EC2_AZ%%/$AZ/g" /usr/share/nginx/html/index.html' \
+            || echo "  Skipped $ID — not reachable yet; it'll self-update via its own boot script if it's brand new"
           done
+
+      - name: Show load balancer URL
+        run: |
+          DNS=$(aws cloudformation describe-stacks \
+            --stack-name my-web-server-${{ github.ref_name }} \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerDNS'].OutputValue" \
+            --output text \
+            --region us-east-1)
+          echo "Site is live at: http://$DNS"

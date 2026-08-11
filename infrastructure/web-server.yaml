@@ -1,46 +1,150 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: A simple, version-controlled web server
+Description: Auto-scaling web app behind a load balancer, pulling student content from GitHub
 
 Parameters:
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Name of an existing EC2 key pair
+  EnvironmentName:
+    Type: String
+    Description: Labels resources AND selects which git branch to pull from (main or dev)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the load balancer and target group
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the load balancer and instances (2+, different AZs)
+  GitHubUser:
+    Type: String
+    Description: GitHub username that owns the site repo
+  GitHubRepo:
+    Type: String
+    Description: Name of the PUBLIC repo containing index.html
 
 Resources:
-  WebServerSG:
+  ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP and SSH
+      GroupDescription: Allow HTTP from the internet
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
 
-  WebServer:
-    Type: AWS::EC2::Instance
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      InstanceType: t2.micro
-      KeyName: !Ref KeyName
-      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      GroupDescription: Allow HTTP from the load balancer and SSH for deploys/debugging
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-launch-template"
+      LaunchTemplateData:
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${EnvironmentName}-server"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf install -y nginx curl
+            chown -R ec2-user:ec2-user /usr/share/nginx/html
+
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+            BASE_URL="https://raw.githubusercontent.com/${GitHubUser}/${GitHubRepo}/${EnvironmentName}"
+            curl -s -o /usr/share/nginx/html/index.html "$BASE_URL/index.html"
+
+            sed -i "s/%%EC2_IP%%/$LOCAL_IP/g; s/%%EC2_AZ%%/$AZ/g" /usr/share/nginx/html/index.html
+
+            systemctl enable nginx
+            systemctl start nginx
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Subnets: !Ref Subnets
       SecurityGroups:
-        - !Ref WebServerSG
-      BlockDeviceMappings:
-        - DeviceName: /dev/xvda
-          Ebs:
-            VolumeType: gp2
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          dnf install -y nginx
-          systemctl enable nginx
-          systemctl start nginx
-          chown -R ec2-user:ec2-user /usr/share/nginx/html
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Listener
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-asg"
+      MinSize: 2
+      MaxSize: 10
+      DesiredCapacity: 2
+      VPCZoneIdentifier: !Ref Subnets
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 60
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref TargetGroup
+
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Join
+            - '/'
+            - - !GetAtt LoadBalancer.LoadBalancerFullName
+              - !GetAtt TargetGroup.TargetGroupFullName
+        TargetValue: 30
 
 Outputs:
-  PublicIP:
-    Value: !GetAtt WebServer.PublicIp
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
