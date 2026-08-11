@@ -119,9 +119,9 @@ Resources:
     DependsOn: Listener
     Properties:
       AutoScalingGroupName: !Sub "${EnvironmentName}-asg"
-      MinSize: 2
+      MinSize: 3
       MaxSize: 10
-      DesiredCapacity: 2
+      DesiredCapacity: 5
       VPCZoneIdentifier: !Ref Subnets
       HealthCheckType: ELB
       HealthCheckGracePeriod: 60
