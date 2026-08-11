@@ -70,7 +70,7 @@ Resources:
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
-            dnf install -y nginx curl
+            dnf install -y nginx
             chown -R ec2-user:ec2-user /usr/share/nginx/html
 
             TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
