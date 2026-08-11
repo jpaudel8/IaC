@@ -74,13 +74,13 @@ Resources:
             chown -R ec2-user:ec2-user /usr/share/nginx/html
 
             TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-            LOCAL_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+            PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
             AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
             BASE_URL="https://raw.githubusercontent.com/${GitHubUser}/${GitHubRepo}/${EnvironmentName}"
             curl -s -o /usr/share/nginx/html/index.html "$BASE_URL/index.html"
 
-            sed -i "s/%%EC2_IP%%/$LOCAL_IP/g; s/%%EC2_AZ%%/$AZ/g" /usr/share/nginx/html/index.html
+            sed -i "s/%%EC2_IP%%/$PUBLIC_IP/g; s/%%EC2_AZ%%/$AZ/g" /usr/share/nginx/html/index.html
 
             systemctl enable nginx
             systemctl start nginx
