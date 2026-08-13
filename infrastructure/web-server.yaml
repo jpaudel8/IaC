@@ -1,108 +1,339 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Auto-scaling web app behind a load balancer, pulling student content from GitHub
+Description: >-
+  Auto-scaling nginx web tier behind an internet-facing ALB. Instances self-provision
+  from a public GitHub repo at boot and are kept in sync afterwards via SSM Run Command.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Environment}
+        Parameters: [EnvironmentName, GitHubUser, GitHubRepo]
+      - Label: {default: Network}
+        Parameters: [VpcId, Subnets, SshCidr]
+      - Label: {default: Compute}
+        Parameters: [InstanceType, KeyName, InstanceProfileName]
+      - Label: {default: Scaling}
+        Parameters: [MinSize, MaxSize, DesiredCapacity, RequestsPerTarget, CpuTargetPercent]
 
 Parameters:
-  KeyName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: Name of an existing EC2 key pair
   EnvironmentName:
     Type: String
-    Description: Labels resources AND selects which git branch to pull from (main or dev)
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: VPC for the load balancer and target group
-  Subnets:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Subnets for the load balancer and instances (2+, different AZs)
+    Description: Labels resources AND selects which git branch to pull content from (main or dev)
+    AllowedPattern: '[a-zA-Z0-9-]{1,20}'
+
   GitHubUser:
     Type: String
     Description: GitHub username that owns the site repo
+
   GitHubRepo:
     Type: String
     Description: Name of the PUBLIC repo containing index.html
 
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the load balancer and target group
+
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Public subnets in 2+ AZs. Only pass AZs that actually offer InstanceType --
+      us-east-1e does not offer t3.*, and an ASG that keeps trying to launch there
+      will silently stall part-way through a scale-out.
+
+  SshCidr:
+    Type: String
+    Default: ''
+    Description: >-
+      CIDR allowed to SSH on port 22. Leave EMPTY (recommended) to open no SSH at all --
+      use "aws ssm start-session --target <instance-id>" instead, which needs no key,
+      no open port and no public IP.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    # Kept inside the intersection of the two lab IAM guardrails: Ec2RestrictInstanceTypes
+    # (nano/micro/small/medium on RunInstances) and AsgRestrict (t2/t3 nano/micro/small).
+    AllowedValues: [t2.nano, t2.micro, t2.small, t3.nano, t3.micro, t3.small]
+
+  KeyName:
+    Type: String
+    Default: vockey
+    Description: EC2 key pair name. Leave empty for no key pair (SSM still works).
+
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: >-
+      Instance profile granting AmazonSSMManagedInstanceCore, so the deploy workflow can
+      push content without SSH. Empty disables it.
+
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  MaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    Description: >-
+      MUST fit the account's concurrent-instance cap. AWS Academy Learner Lab allows 9
+      running instances TOTAL, and the lab's own "Bastion Host" + "Lab Instance" occupy 2 of
+      them, leaving 7. Setting this higher does not get you more servers: the ASG launches
+      instances that are killed on sight, replaces them, and loops -- which shows up in the
+      console as permanently unhealthy targets. 6 leaves one slot spare for replacements.
+
+  DesiredCapacity:
+    Type: String
+    Default: '2'
+    Description: >-
+      Starting size. Set to EMPTY to let CloudFormation stop managing this value -- otherwise
+      every stack update snaps the group back to this number and undoes any live scaling.
+
+  RequestsPerTarget:
+    Type: Number
+    Default: 60
+    Description: >-
+      Target-tracking setpoint: requests per target per minute. The group scales until each
+      instance sees roughly this much traffic, so LOWER = more instances for the same load.
+
+  CpuTargetPercent:
+    Type: Number
+    Default: 70
+    Description: Secondary safety net. Static content never reaches this; a real app would.
+
+Conditions:
+  HasSsh: !Not [!Equals [!Ref SshCidr, '']]
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasInstanceProfile: !Not [!Equals [!Ref InstanceProfileName, '']]
+  ManageDesiredCapacity: !Not [!Equals [!Ref DesiredCapacity, '']]
+
 Resources:
+  # ---------------------------------------------------------------- networking
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP from the internet
+      GroupDescription: !Sub 'ALB ${EnvironmentName}: HTTP in from the internet'
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      # Declaring egress inline replaces the implicit allow-all, pinning the ALB to
+      # talking only to our instances on :80.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: HTTP to the web tier
+      Tags:
+        - {Key: Name, Value: !Sub '${EnvironmentName}-alb-sg'}
 
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP from the load balancer and SSH for deploys/debugging
+      # No inline ingress: rules live in separate resources so the ALB SG can reference
+      # this group for egress without creating a circular dependency.
+      GroupDescription: !Sub 'Web tier ${EnvironmentName}'
       VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: !Sub '${EnvironmentName}-web-sg'}
 
+  InstanceHttpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: HTTP from the load balancer only
+
+  InstanceSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSsh
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr
+      Description: SSH for debugging
+
+  # ---------------------------------------------------------------- compute
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
-      LaunchTemplateName: !Sub "${EnvironmentName}-launch-template"
+      LaunchTemplateName: !Sub '${EnvironmentName}-launch-template'
       LaunchTemplateData:
-        InstanceType: t2.micro
-        KeyName: !Ref KeyName
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
         ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        IamInstanceProfile:
+          !If
+            - HasInstanceProfile
+            - {Name: !Ref InstanceProfileName}
+            - !Ref 'AWS::NoValue'
         SecurityGroupIds:
           - !Ref InstanceSecurityGroup
+        Monitoring:
+          Enabled: true          # 1-minute EC2 metrics, so CPU-based scaling reacts in ~1 min not ~5
+        MetadataOptions:
+          HttpTokens: required   # IMDSv2 only
+          HttpPutResponseHopLimit: 1
+        CreditSpecification:
+          CpuCredits: standard   # never silently bill for t3 "unlimited" burst during a stress test
         BlockDeviceMappings:
           - DeviceName: /dev/xvda
             Ebs:
+              # gp2, not gp3: the lab's Ec2RestrictPIOPSVolumes statement is an explicit
+              # Deny on any ec2:VolumeType outside [gp2, standard]. Size stays well under
+              # the 35 GiB ceiling in Ec2RestrictLargeVolumes.
               VolumeType: gp2
+              VolumeSize: 8
+              DeleteOnTermination: true
+              Encrypted: true
         TagSpecifications:
           - ResourceType: instance
             Tags:
-              - Key: Name
-                Value: !Sub "${EnvironmentName}-server"
+              - {Key: Name, Value: !Sub '${EnvironmentName}-server'}
+              - {Key: Environment, Value: !Ref EnvironmentName}
+          - ResourceType: volume
+            Tags:
+              - {Key: Name, Value: !Sub '${EnvironmentName}-server'}
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
-            dnf install -y nginx
-            chown -R ec2-user:ec2-user /usr/share/nginx/html
+            # Everything lands in /var/log/user-data.log AND the console log, so a failed
+            # instance can be diagnosed without SSH.
+            exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+            set -x
 
-            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-            PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
-            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            WEBROOT=/usr/share/nginx/html
 
-            BASE_URL="https://raw.githubusercontent.com/${GitHubUser}/${GitHubRepo}/${EnvironmentName}"
-            curl -s -o /usr/share/nginx/html/index.html "$BASE_URL/index.html"
+            echo "=== [1/4] install nginx (retried: dnf mirrors are flaky at boot) ==="
+            for attempt in 1 2 3 4 5; do
+              dnf install -y nginx && break
+              echo "dnf attempt $attempt failed, retrying in 10s"
+              sleep 10
+            done
+            mkdir -p $WEBROOT
 
-            sed -i "s/%%EC2_IP%%/$PUBLIC_IP/g; s/%%EC2_AZ%%/$AZ/g" /usr/share/nginx/html/index.html
+            echo "=== [2/4] install the render script ==="
+            # The same script the deploy workflow invokes over SSM. Keeping one copy on the
+            # instance means the deploy step is a single argument-free command instead of a
+            # shell script nested inside JSON inside YAML, which is unmaintainable and was
+            # already silently mangling its own quoting.
+            cat > /usr/local/bin/render-site.sh <<'RENDER'
+            #!/bin/bash
+            # Usage: render-site.sh [git-ref]   (branch name or commit sha)
+            set -uo pipefail
+            # "$*" not "$1": under set -u an unset $1 aborts the script, and $* is always
+            # defined. Braces are avoided throughout so Fn::Sub leaves shell vars alone.
+            REF=$*
+            [ -n "$REF" ] || REF=main
+            WEBROOT=/usr/share/nginx/html
+            BASE="https://raw.githubusercontent.com/${GitHubUser}/${GitHubRepo}/$REF"
 
-            systemctl enable nginx
-            systemctl start nginx
+            # Health endpoint first, and deliberately with NO external dependency. The ALB
+            # checks this, not /, so a GitHub outage can never make a healthy instance look
+            # unhealthy and get it terminated.
+            printf 'ok\n' > $WEBROOT/health
 
+            # -f so an HTTP 404 fails instead of writing the literal body "404: Not Found"
+            # into index.html, which would still return 200 and look perfectly healthy.
+            if ! curl -fsS --retry 5 --retry-delay 3 --retry-connrefused \
+                 -H 'Cache-Control: no-cache' -o /tmp/index.html "$BASE/index.html"; then
+              echo "WARNING: could not fetch $BASE/index.html - leaving current page in place"
+              exit 0
+            fi
+
+            TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token \
+              -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+            META=http://169.254.169.254/latest/meta-data
+            IP=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" $META/public-ipv4 || echo unknown)
+            AZ=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" $META/placement/availability-zone || echo unknown)
+            IID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" $META/instance-id || echo unknown)
+
+            sed -i "s|%%EC2_IP%%|$IP|g; s|%%EC2_AZ%%|$AZ|g; s|%%EC2_ID%%|$IID|g" /tmp/index.html
+            cp /tmp/index.html $WEBROOT/index.html
+            chown ec2-user:ec2-user $WEBROOT/index.html
+            echo "rendered $REF on $IID"
+            RENDER
+            chmod 0755 /usr/local/bin/render-site.sh
+
+            echo "=== [2b/4] stop the browser caching the page ==="
+            # Without this a browser refresh is served from its own disk cache and never
+            # reaches the ALB at all, so the page appears pinned to one instance no matter
+            # how many are healthy. add_header is valid in the http context, which is where
+            # conf.d/*.conf is included.
+            cat > /etc/nginx/conf.d/nocache.conf <<'NOCACHE'
+            add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+            NOCACHE
+
+            echo "=== [3/4] start nginx BEFORE fetching content ==="
+            # Ordering matters: a fallback page plus an early start means the target passes
+            # health checks in ~20s rather than waiting on a network fetch that might hang.
+            cat > $WEBROOT/index.html <<'FALLBACK'
+            <!doctype html>
+            <html><head><meta charset="utf-8"><title>My Site</title></head>
+            <body><h1>Starting up...</h1></body></html>
+            FALLBACK
+            printf 'ok\n' > $WEBROOT/health
+            systemctl enable --now nginx
+
+            echo "=== [4/4] pull real content (best effort - never fatal) ==="
+            /usr/local/bin/render-site.sh ${EnvironmentName}
+
+            systemctl reload nginx || systemctl restart nginx
+            echo "=== user-data complete ==="
+
+  # ---------------------------------------------------------------- load balancing
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: !Sub "${EnvironmentName}-tg"
+      Name: !Sub '${EnvironmentName}-tg'
       Port: 80
       Protocol: HTTP
       VpcId: !Ref VpcId
-      HealthCheckPath: /
+      TargetType: instance
+      # Defaults here are 30s interval x 5 healthy checks = 150s before a target is usable.
+      # 10s x 2 gets it to ~20s, which is what makes a scale-out actually feel like scaling.
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '15'}
+        # round_robin, not least_outstanding_requests: with one browser refreshing by hand
+        # there are no outstanding requests to compare, so LOR keeps picking the same few
+        # targets and it looks like the balancer is broken. Round robin visibly rotates.
+        - {Key: load_balancing.algorithm.type, Value: round_robin}
+      Tags:
+        - {Key: Environment, Value: !Ref EnvironmentName}
 
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "${EnvironmentName}-alb"
+      Name: !Sub '${EnvironmentName}-alb'
       Subnets: !Ref Subnets
       SecurityGroups:
         - !Ref ALBSecurityGroup
       Scheme: internet-facing
       Type: application
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: '60'}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+      Tags:
+        - {Key: Environment, Value: !Ref EnvironmentName}
 
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -114,24 +345,41 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
+  # ---------------------------------------------------------------- autoscaling
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: Listener
     Properties:
-      AutoScalingGroupName: !Sub "${EnvironmentName}-asg"
-      MinSize: 3
-      MaxSize: 10
-      DesiredCapacity: 5
+      AutoScalingGroupName: !Sub '${EnvironmentName}-asg'
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity:
+        !If [ManageDesiredCapacity, !Ref DesiredCapacity, !Ref 'AWS::NoValue']
       VPCZoneIdentifier: !Ref Subnets
-      HealthCheckType: ELB
-      HealthCheckGracePeriod: 60
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
       TargetGroupARNs:
         - !Ref TargetGroup
+      HealthCheckType: ELB
+      # AL2023 boot + dnf install nginx is 90-180s. A 60s grace period means the ASG starts
+      # judging instances before nginx exists, kills them, launches replacements, and loops
+      # forever -- which is exactly what "targets are unhealthy" looks like from the console.
+      HealthCheckGracePeriod: 300
+      # Without this, target tracking falls back to the 300s default cooldown between
+      # scale-out steps, so a 5-minute stress test only ever gets one bump.
+      DefaultInstanceWarmup: 30
+      Cooldown: '60'
+      MetricsCollection:
+        - Granularity: 1Minute
+      TerminationPolicies: [OldestInstance]
+      Tags:
+        - {Key: Name, Value: !Sub '${EnvironmentName}-server', PropagateAtLaunch: true}
+        - {Key: Environment, Value: !Ref EnvironmentName, PropagateAtLaunch: true}
 
-  ScalingPolicy:
+  # Primary policy. RequestCountPerTarget is the right signal for static content, where
+  # CPU barely moves no matter how much traffic arrives.
+  RequestScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
     Properties:
       AutoScalingGroupName: !Ref AutoScalingGroup
@@ -143,8 +391,33 @@ Resources:
             - '/'
             - - !GetAtt LoadBalancer.LoadBalancerFullName
               - !GetAtt TargetGroup.TargetGroupFullName
-        TargetValue: 30
+        TargetValue: !Ref RequestsPerTarget
+
+  # Safety net for a workload that IS cpu-bound. Multiple target-tracking policies are
+  # additive-safe: the ASG takes the largest scale-out and only scales in when all agree.
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTargetPercent
 
 Outputs:
   LoadBalancerDNS:
+    Description: ALB hostname
     Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-alb-dns'
+  LoadBalancerURL:
+    Description: Open this in a browser
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  StressTestCommand:
+    Description: Copy-paste to drive a scale-out
+    Value: !Sub './stress-test.sh http://${LoadBalancer.DNSName} 600 40'
