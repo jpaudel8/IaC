@@ -1,34 +1,40 @@
-name: Deploy Infrastructure
+name: Deploy Website
 
 on:
   push:
     branches: [main, dev]
   workflow_dispatch:
 
-# A second push while the first is still deploying makes CloudFormation throw
-# "stack is in UPDATE_IN_PROGRESS". Queue instead of racing.
+# Two pushes at once make CloudFormation throw "stack is in UPDATE_IN_PROGRESS".
+# Queue them instead of racing.
 concurrency:
   group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-east-1
-  STACK_NAME: my-web-server-${{ github.ref_name }}
+  TEMPLATE: infrastructure/server.yaml
   INSTANCE_TYPE: t3.micro
-  TEMPLATE: infrastructure/web-server.yaml
-  # Concurrent running-instance ceiling for the whole account. AWS Academy Learner Lab
-  # enforces 9; raise this if you move to an account without that guardrail.
-  INSTANCE_CAP: 9
 
 permissions:
   contents: read
 
 jobs:
-  deploy-infra:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Pick the environment from the branch
+        id: env
+        run: |
+          set -euo pipefail
+          # main -> prod, dev -> dev. One stack per environment, so the two servers can
+          # never overwrite each other.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then ENV=prod; else ENV=dev; fi
+          echo "name=$ENV"        >> "$GITHUB_OUTPUT"
+          echo "stack=web-$ENV"   >> "$GITHUB_OUTPUT"
+          echo "Branch $GITHUB_REF_NAME -> environment $ENV"
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -40,230 +46,123 @@ jobs:
       - name: Validate template
         run: aws cloudformation validate-template --template-body file://"$TEMPLATE" >/dev/null
 
-      - name: Resolve VPC and subnets
+      - name: Find the default VPC and one subnet
         id: net
         run: |
           set -euo pipefail
-
-          VPC_ID=$(aws ec2 describe-vpcs \
-            --filters Name=is-default,Values=true \
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
             --query 'Vpcs[0].VpcId' --output text)
           [ "$VPC_ID" != "None" ] || { echo "::error::no default VPC in $AWS_REGION"; exit 1; }
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
+            --query 'Subnets[0].SubnetId' --output text)
 
-          # Only AZs that actually offer the instance type. us-east-1e has no t3.*, and an
-          # ASG that keeps trying to launch into it stalls part-way through a scale-out
-          # instead of failing loudly.
-          GOOD_AZS=$(aws ec2 describe-instance-type-offerings \
-            --location-type availability-zone \
-            --filters Name=instance-type,Values="$INSTANCE_TYPE" \
-            --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' '\n' | sort)
-          echo "AZs offering $INSTANCE_TYPE: $(echo $GOOD_AZS)"
+          echo "vpc_id=$VPC_ID"       >> "$GITHUB_OUTPUT"
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+          echo "Using $VPC_ID / $SUBNET_ID"
 
-          # Three AZs is plenty of spread and keeps the ALB cheap.
-          SUBNET_IDS=$(aws ec2 describe-subnets \
-            --filters Name=vpc-id,Values="$VPC_ID" \
-                      Name=default-for-az,Values=true \
-                      Name=availability-zone,Values="$(echo $GOOD_AZS | tr ' ' ',')" \
-            --query 'sort_by(Subnets,&AvailabilityZone)[].SubnetId' --output text \
-            | tr '\t' '\n' | head -3 | paste -sd,)
-
-          [ "$(echo "$SUBNET_IDS" | tr ',' '\n' | wc -l)" -ge 2 ] \
-            || { echo "::error::need subnets in 2+ AZs, got '$SUBNET_IDS'"; exit 1; }
-
-          echo "vpc_id=$VPC_ID"        >> "$GITHUB_OUTPUT"
-          echo "subnet_ids=$SUBNET_IDS" >> "$GITHUB_OUTPUT"
-          echo "Using $VPC_ID / $SUBNET_IDS"
-
-      - name: Size the group to fit the account's instance cap
-        id: cap
+      - name: Clear a stack stuck in ROLLBACK
         run: |
           set -euo pipefail
-          # AWS Academy Learner Lab hard-caps CONCURRENT RUNNING INSTANCES (9), and the lab's
-          # own "Bastion Host" and "Lab Instance" occupy some of that. Sizing the ASG above
-          # what is left does not give you more servers -- the extras are killed on sight,
-          # the ASG replaces them, and the group churns forever. From the console that looks
-          # exactly like "my targets keep going unhealthy", which is the symptom it caused.
-          # Both counts must come from EC2. Asking the ASG how many instances it has returns
-          # its own bookkeeping, which over-reports while the group is churning -- subtracting
-          # that from a real EC2 count yields a negative "others" and an inflated MaxSize.
-          TOTAL=$(aws ec2 describe-instances \
-            --filters Name=instance-state-name,Values=running,pending \
-            --query 'length(Reservations[].Instances[])' --output text)
-          OURS=$(aws ec2 describe-instances \
-            --filters Name=instance-state-name,Values=running,pending \
-                      Name=tag:aws:autoscaling:groupName,Values="${{ github.ref_name }}-asg" \
-            --query 'length(Reservations[].Instances[])' --output text)
-
-          OTHERS=$(( TOTAL - OURS ))
-          MAX=$(( INSTANCE_CAP - OTHERS - 1 ))   # -1 leaves a slot free for replacements
-          [ "$MAX" -lt 2 ] && MAX=2
-
-          echo "cap=$INSTANCE_CAP running=$TOTAL ours=$OURS other=$OTHERS -> MaxSize=$MAX"
-          echo "max_size=$MAX" >> "$GITHUB_OUTPUT"
-
-      - name: Clear failed stack
-        run: |
-          set -euo pipefail
-          # A stack left in ROLLBACK_COMPLETE can never be updated, only deleted. Without
-          # this, every subsequent push fails with a confusing "cannot update" error.
-          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+          # A stack in ROLLBACK_COMPLETE can never be updated, only deleted. Without this,
+          # every later push fails with a confusing "cannot update" error.
+          STACK='${{ steps.env.outputs.stack }}'
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
             --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
           echo "Current status: $STATUS"
           case "$STATUS" in
             ROLLBACK_COMPLETE|ROLLBACK_FAILED|DELETE_FAILED|REVIEW_IN_PROGRESS)
-              echo "Deleting unusable stack..."
-              aws cloudformation delete-stack --stack-name "$STACK_NAME"
-              aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+              aws cloudformation delete-stack --stack-name "$STACK"
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK"
               ;;
           esac
-
-      - name: Deploy stack
+      - name: Deploy the server
         run: |
           set -euo pipefail
-          # Derived, never hardcoded: GITHUB_REPOSITORY is always "owner/repo", so this keeps
-          # working in forks and after a rename. github.event.repository.name is avoided
-          # because it depends on the event payload rather than always being present.
+          # Derived, never hardcoded: GITHUB_REPOSITORY is always "owner/repo", so this
+          # keeps working after a fork or a rename.
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY#*/}"
-          echo "Deploying content source: $OWNER/$REPO @ ${{ github.ref_name }}"
-
           aws cloudformation deploy \
             --template-file "$TEMPLATE" \
-            --stack-name "$STACK_NAME" \
+            --stack-name '${{ steps.env.outputs.stack }}' \
             --no-fail-on-empty-changeset \
-            --tags Environment=${{ github.ref_name }} ManagedBy=github-actions \
+            --tags Environment=${{ steps.env.outputs.name }} ManagedBy=github-actions \
             --parameter-overrides \
-              EnvironmentName=${{ github.ref_name }} \
+              EnvironmentName=${{ steps.env.outputs.name }} \
               GitHubUser="$OWNER" \
               GitHubRepo="$REPO" \
+              GitBranch=${{ github.ref_name }} \
               VpcId=${{ steps.net.outputs.vpc_id }} \
-              Subnets=${{ steps.net.outputs.subnet_ids }} \
+              SubnetId=${{ steps.net.outputs.subnet_id }} \
               InstanceType=$INSTANCE_TYPE \
-              KeyName=vockey \
-              InstanceProfileName=LabInstanceProfile \
-              MinSize=2 \
-              MaxSize=${{ steps.cap.outputs.max_size }} \
-              DesiredCapacity=2 \
-              RequestsPerTarget=60
+              KeyName=vockey
 
       - name: Show why, if it failed
         if: failure()
         run: |
-          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+          aws cloudformation describe-stack-events --stack-name '${{ steps.env.outputs.stack }}' \
             --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`||ResourceStatus==`UPDATE_FAILED`].[Timestamp,LogicalResourceId,ResourceStatusReason])' \
             --output table || true
-
-      - name: Read stack outputs
+      - name: Read the server address
         id: out
         run: |
           set -euo pipefail
-          get() {
-            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
-          }
-          echo "dns=$(get LoadBalancerDNS)"   >> "$GITHUB_OUTPUT"
-          echo "asg=$(get AutoScalingGroupName)" >> "$GITHUB_OUTPUT"
-          echo "tg=$(get TargetGroupArn)"     >> "$GITHUB_OUTPUT"
-
-      - name: Wait for targets to become healthy
+          IP=$(aws cloudformation describe-stacks --stack-name '${{ steps.env.outputs.stack }}' \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Server: $IP"
+      - name: Wait for the server to answer
         run: |
           set -uo pipefail
-          TG='${{ steps.out.outputs.tg }}'
-          DNS='${{ steps.out.outputs.dns }}'
-          # Instances need to boot, install nginx and pass 2 health checks. Poll rather
-          # than sleeping a fixed amount so a fast deploy is not artificially slow.
-          for i in $(seq 1 60); do
-            STATES=$(aws elbv2 describe-target-health --target-group-arn "$TG" \
-              --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
-            HEALTHY=$(echo "$STATES" | tr '\t' '\n' | grep -c healthy || true)
-            echo "[$i/60] targets: ${STATES:-none} (healthy=$HEALTHY)"
-            if [ "$HEALTHY" -ge 1 ]; then
-              # Registered-and-healthy is necessary but not sufficient: assert the ALB
-              # actually serves a 200 before calling the deploy good.
-              CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://$DNS/" || echo 000)
-              echo "  end-to-end GET / -> $CODE"
-              [ "$CODE" = "200" ] && exit 0
-            fi
+          IP='${{ steps.out.outputs.ip }}'
+          # A fresh instance needs to boot and install nginx (90-180s). Poll instead of
+          # sleeping a fixed time, so an update deploy is not artificially slow.
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$IP/health" || echo 000)
+            echo "[$i/40] GET /health -> $CODE"
+            [ "$CODE" = "200" ] && exit 0
             sleep 10
           done
-          echo "::error::no healthy target serving 200 within 10 minutes"
-          aws elbv2 describe-target-health --target-group-arn "$TG" --output table
+          echo "::error::server did not answer within ~7 minutes"
           exit 1
-
-      - name: Push latest content to running instances
+      - name: Push this commit to the server
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
           set -euo pipefail
-          ASG='${{ steps.out.outputs.asg }}'
-
-          # Fallback for environments whose IAM policy has no iam:PassRole (so the template
-          # runs with InstanceProfileName='' and there is no SSM agent to talk to). Replacing
-          # the instances makes them re-run the boot script against this commit. Slower, but
-          # it only needs autoscaling:*, which every lab policy here grants.
-          roll_instances() {
-            echo "Falling back to an instance refresh..."
-            aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-              --preferences '{"MinHealthyPercentage":50,"InstanceWarmup":60}' \
-              --query InstanceRefreshId --output text
-          }
-
-          # SSM Run Command instead of scp/ssh: no private key in secrets, no port 22 open
-          # to the world, and it works even on instances with no public IP.
-          IDS=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "$ASG" \
-            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
-            --output text | tr '\t' ' ')
-          echo "In-service: ${IDS:-none}"
-          [ -n "$IDS" ] || { echo "nothing to update"; exit 0; }
-
-          # Only instances SSM can actually reach; the rest already pulled this commit at boot.
-          ONLINE=$(aws ssm describe-instance-information \
-            --filters Key=InstanceIds,Values="$(echo $IDS | tr ' ' ',')" \
-            --query "InstanceInformationList[?PingStatus=='Online'].InstanceId" \
-            --output text 2>/dev/null | tr '\t' ' ' || echo "")
-          echo "SSM online: ${ONLINE:-none}"
-          [ -n "$ONLINE" ] || { roll_instances; exit 0; }
-
-          # render-site.sh already lives on every instance (written by user-data) and takes
-          # a git ref. Passing the commit sha pins the deploy to exactly this build rather
-          # than whatever the branch happens to point at by the time the agent runs.
-          CMD_ID=$(aws ssm send-command \
-            --document-name AWS-RunShellScript \
-            --instance-ids $ONLINE \
-            --comment "deploy ${{ github.sha }}" \
-            --parameters '{"commands":["/usr/local/bin/render-site.sh ${{ github.sha }}"]}' \
-            --query 'Command.CommandId' --output text)
-
-          echo "SSM command $CMD_ID dispatched"
-          # send-command is async; give it a moment before asking for results.
-          for i in $(seq 1 20); do
-            sleep 6
-            ST=$(aws ssm list-command-invocations --command-id "$CMD_ID" \
-              --query 'CommandInvocations[].Status' --output text | tr '\t' ' ')
-            echo "[$i/20] $ST"
-            echo "$ST" | grep -qE 'Pending|InProgress|Delayed' || break
+          IP='${{ steps.out.outputs.ip }}'
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lab.pem
+          chmod 600 ~/.ssh/lab.pem
+          # The commit sha, not the branch name: this pins the page to exactly the code
+          # that triggered the run, not to whatever the branch points at a minute later.
+          n=0
+          until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/lab.pem \
+                ec2-user@"$IP" "sudo /usr/local/bin/render-site.sh ${{ github.sha }}"; do
+            n=$((n+1))
+            [ "$n" -lt 8 ] || { echo "::error::could not reach the server over SSH"; exit 1; }
+            echo "ssh not ready, retry $n"
+            sleep 10
           done
 
-          aws ssm list-command-invocations --command-id "$CMD_ID" --details \
-            --query 'CommandInvocations[].[InstanceId,Status,CommandPlugins[0].Output]' \
-            --output text
-          FAILED=$(aws ssm list-command-invocations --command-id "$CMD_ID" \
-            --query "length(CommandInvocations[?Status=='Failed'])" --output text)
-          [ "$FAILED" = "0" ] || { echo "::error::$FAILED instance(s) failed to update"; exit 1; }
-
+      - name: Verify what is actually live
+        run: |
+          IP='${{ steps.out.outputs.ip }}'
+          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
+          PAGE=$(curl -s --max-time 15 "http://$IP/")
+          echo "$PAGE" | grep -q "$SHORT" \
+            && echo "Live version is $SHORT" \
+            || echo "Warning: the page does not show $SHORT"
       - name: Summary
         run: |
-          DNS='${{ steps.out.outputs.dns }}'
           {
-            echo "## Deployed :rocket:"
+            echo "## Deployed ${{ steps.env.outputs.name }}"
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| URL | http://$DNS |"
-            echo "| Stack | \`$STACK_NAME\` |"
-            echo "| ASG | \`${{ steps.out.outputs.asg }}\` |"
-            echo ""
-            echo '```bash'
-            echo "./stress-test.sh http://$DNS 600 40"
-            echo '```'
+            echo "| URL | http://${{ steps.out.outputs.ip }} |"
+            echo "| Stack | ${{ steps.env.outputs.stack }} |"
+            echo "| Branch | ${{ github.ref_name }} |"
+            echo "| Commit | ${{ github.sha }} |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Site is live at: http://$DNS"

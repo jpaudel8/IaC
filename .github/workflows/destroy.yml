@@ -1,0 +1,39 @@
+name: Destroy Servers
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Which server to delete
+        type: choice
+        options: [dev, prod, both]
+        default: dev
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete stacks
+        run: |
+          set -euo pipefail
+          case '${{ inputs.environment }}' in
+            both) STACKS="web-dev web-prod" ;;
+            *)    STACKS="web-${{ inputs.environment }}" ;;
+          esac
+          for s in $STACKS; do
+            echo "Deleting $s ..."
+            aws cloudformation delete-stack --stack-name "$s"
+            aws cloudformation wait stack-delete-complete --stack-name "$s"
+            echo "$s deleted"
+          done

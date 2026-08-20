@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One nginx web server on EC2. It downloads its pages from a public GitHub repo at boot,
+  and the deploy workflow refreshes them over SSH afterwards.
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Names the resources and is printed on the page
+
+  GitHubUser:
+    Type: String
+    Description: GitHub username that owns the repo
+
+  GitHubRepo:
+    Type: String
+    Description: Name of the PUBLIC repo containing index.html
+
+  GitBranch:
+    Type: String
+    Description: Branch this server serves. dev server -> dev, prod server -> main
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A DEFAULT subnet - those auto-assign a public IP, so no Elastic IP is needed
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    # Inside both lab guardrails: Ec2RestrictInstanceTypes allows nano/micro/small/medium.
+    AllowedValues: [t2.nano, t2.micro, t2.small, t3.nano, t3.micro, t3.small]
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: vockey
+    Description: The key pair the Learner Lab gives you. The deploy workflow uses it for SSH
+
+  SshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >-
+      Who may SSH on port 22. GitHub-hosted runners have no fixed IP address, so this has
+      to stay open for the deploy step to work. Acceptable in a lab, never in production.
+Resources:
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'Web server ${EnvironmentName}'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshCidr
+          Description: SSH for the deploy workflow
+      Tags:
+        - {Key: Name, Value: !Sub '${EnvironmentName}-web-sg'}
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      # Latest Amazon Linux 2023, looked up at deploy time instead of hardcoding an AMI id
+      # that expires. Owner is amazon, which the lab policy requires.
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      # No IamInstanceProfile on purpose: the lab policy grants no iam:PassRole, so attaching
+      # one fails. That also means no SSM agent, which is why the workflow deploys over SSH.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            # gp2, not gp3: the lab policy is an explicit Deny on any volume type outside
+            # [gp2, standard]. 8 GiB is well under the 35 GiB ceiling.
+            VolumeType: gp2
+            VolumeSize: 8
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      Tags:
+        - {Key: Name, Value: !Sub '${EnvironmentName}-web-server'}
+        - {Key: Environment, Value: !Ref EnvironmentName}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Everything lands in /var/log/user-data.log and the console log, so a broken
+          # instance can be diagnosed without logging in.
+          exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+          set -x
+          WEBROOT=/usr/share/nginx/html
+          echo "${EnvironmentName}" > /etc/site-env
+
+          echo "=== [1/4] install nginx (retried: dnf mirrors are flaky at boot) ==="
+          for attempt in 1 2 3 4 5; do
+            dnf install -y nginx && break
+            echo "attempt $attempt failed, retrying in 10s"
+            sleep 10
+          done
+          mkdir -p $WEBROOT
+
+          echo "=== [2/4] install the render script ==="
+          # The same script the deploy workflow calls over SSH. Keeping one copy on the
+          # instance means deploying is a single command instead of a shell script buried
+          # inside YAML.
+          cat > /usr/local/bin/render-site.sh <<'RENDER'
+          #!/bin/bash
+          # Usage: render-site.sh [git-ref]   (branch name or commit sha)
+          set -uo pipefail
+          # "$*" not "$1": under set -u an unset $1 aborts the script. Shell variables are
+          # written without braces so CloudFormation leaves them alone.
+          REF=$*
+          [ -n "$REF" ] || REF=main
+          WEBROOT=/usr/share/nginx/html
+          ENVNAME=$(cat /etc/site-env 2>/dev/null || echo unknown)
+          BASE="https://raw.githubusercontent.com/${GitHubUser}/${GitHubRepo}/$REF"
+
+          # Health file first, with no external dependency: a GitHub outage must never make
+          # a working server look broken.
+          printf 'ok\n' > $WEBROOT/health
+
+          GOT=""
+          for f in index.html about.html contact.html style.css; do
+            # -f so a 404 fails instead of saving the words "404: Not Found" as a web page.
+            if curl -fsS --retry 3 --retry-delay 2 -H 'Cache-Control: no-cache' \
+                 -o /tmp/$f "$BASE/$f"; then
+              GOT="$GOT $f"
+            else
+              echo "not present in $REF: $f"
+            fi
+          done
+          [ -n "$GOT" ] || { echo "nothing fetched - keeping the current page"; exit 0; }
+
+          TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+          META=http://169.254.169.254/latest/meta-data
+          IP=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" $META/public-ipv4 || echo unknown)
+          AZ=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" $META/placement/availability-zone || echo unknown)
+
+          if [ -f /tmp/index.html ]; then
+            SHORT=$(echo $REF | cut -c1-7)
+            sed -i "s|%%ENV%%|$ENVNAME|g; s|%%EC2_IP%%|$IP|g; s|%%EC2_AZ%%|$AZ|g; s|%%GIT_REF%%|$SHORT|g" /tmp/index.html
+          fi
+
+          for f in $GOT; do cp /tmp/$f $WEBROOT/$f; done
+          chown -R nginx:nginx $WEBROOT
+          echo "rendered $REF ($ENVNAME) from $BASE"
+          RENDER
+          chmod 0755 /usr/local/bin/render-site.sh
+
+          echo "=== [3/4] stop the browser caching the page ==="
+          # Without this a refresh is served from the browser's own disk cache and your
+          # deploy looks like it did nothing.
+          cat > /etc/nginx/conf.d/nocache.conf <<'NOCACHE'
+          add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+          NOCACHE
+
+          echo "=== [4/4] start nginx, then pull the real content ==="
+          # Start with a placeholder page so the server answers immediately, even if the
+          # download is slow.
+          cat > $WEBROOT/index.html <<'FALLBACK'
+          <!doctype html>
+          <html><head><meta charset="utf-8"><title>My Site</title></head>
+          <body><h1>Starting up...</h1></body></html>
+          FALLBACK
+          printf 'ok\n' > $WEBROOT/health
+          systemctl enable --now nginx
+
+          /usr/local/bin/render-site.sh ${GitBranch}
+          systemctl reload nginx || systemctl restart nginx
+          echo "=== user-data complete ==="
+
+Outputs:
+  PublicIp:
+    Value: !GetAtt WebServer.PublicIp
+  URL:
+    Description: Open this in a browser
+    Value: !Sub 'http://${WebServer.PublicIp}'
+  SshCommand:
+    Value: !Sub 'ssh -i labsuser.pem ec2-user@${WebServer.PublicIp}'
