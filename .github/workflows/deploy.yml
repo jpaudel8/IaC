@@ -32,9 +32,10 @@ jobs:
           # main -> prod, dev -> dev. One stack per environment, so the two servers can
           # never overwrite each other.
           if [ "$GITHUB_REF_NAME" = "main" ]; then ENV=prod; else ENV=dev; fi
-          echo "name=$ENV"        >> "$GITHUB_OUTPUT"
-          echo "stack=web-$ENV"   >> "$GITHUB_OUTPUT"
+          echo "name=$ENV"      >> "$GITHUB_OUTPUT"
+          echo "stack=web-$ENV" >> "$GITHUB_OUTPUT"
           echo "Branch $GITHUB_REF_NAME -> environment $ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -46,16 +47,89 @@ jobs:
       - name: Validate template
         run: aws cloudformation validate-template --template-body file://"$TEMPLATE" >/dev/null
 
-      - name: Find the default VPC and one subnet
+      - name: Prepare the network
         id: net
         run: |
           set -euo pipefail
+
+          # ---- 1. a default VPC -------------------------------------------------------
           VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
             --query 'Vpcs[0].VpcId' --output text)
-          [ "$VPC_ID" != "None" ] || { echo "::error::no default VPC in $AWS_REGION"; exit 1; }
-          SUBNET_ID=$(aws ec2 describe-subnets \
+          if [ "$VPC_ID" = "None" ]; then
+            echo "No default VPC in this account - creating one"
+            VPC_ID=$(aws ec2 create-default-vpc --query 'Vpc.VpcId' --output text)
+          fi
+          echo "VPC: $VPC_ID"
+
+          # ---- 2. an internet gateway attached to it ----------------------------------
+          # Without one, an instance gets a public IP that routes nowhere. The console
+          # calls this "the instance is not in a public subnet".
+          IGW=$(aws ec2 describe-internet-gateways \
+            --filters Name=attachment.vpc-id,Values="$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text)
+          if [ "$IGW" = "None" ]; then
+            echo "VPC has no internet gateway - creating and attaching one"
+            IGW=$(aws ec2 create-internet-gateway \
+              --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID"
+          fi
+          echo "IGW: $IGW"
+
+          # ---- 3. a subnet that actually routes to it ---------------------------------
+          SUBNETS=$(aws ec2 describe-subnets \
             --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
-            --query 'Subnets[0].SubnetId' --output text)
+            --query 'sort_by(Subnets,&AvailabilityZone)[].SubnetId' --output text | tr '\t' ' ')
+          if [ -z "$SUBNETS" ]; then
+            SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
+              --query 'Subnets[].SubnetId' --output text | tr '\t' ' ')
+          fi
+          [ -n "$SUBNETS" ] || { echo "::error::VPC $VPC_ID has no subnets"; exit 1; }
+
+          # A subnet with no explicit route table association silently uses the VPC's main
+          # one, so that has to be the fallback rather than an error.
+          MAIN_RT=$(aws ec2 describe-route-tables \
+            --filters Name=vpc-id,Values="$VPC_ID" Name=association.main,Values=true \
+            --query 'RouteTables[0].RouteTableId' --output text)
+
+          route_table_for() {
+            RT=$(aws ec2 describe-route-tables \
+              --filters Name=association.subnet-id,Values="$1" \
+              --query 'RouteTables[0].RouteTableId' --output text)
+            [ "$RT" != "None" ] || RT="$MAIN_RT"
+            echo "$RT"
+          }
+          has_igw_route() {
+            [ "$1" != "None" ] || return 1
+            aws ec2 describe-route-tables --route-table-ids "$1" \
+              --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].GatewayId" \
+              --output text | grep -q '^igw-'
+          }
+
+          SUBNET_ID=""
+          for s in $SUBNETS; do
+            RT=$(route_table_for "$s")
+            if has_igw_route "$RT"; then
+              SUBNET_ID="$s"
+              echo "$s is public (route table $RT)"
+              break
+            fi
+          done
+
+          # ---- 4. repair, if none of them were public ---------------------------------
+          if [ -z "$SUBNET_ID" ]; then
+            s=$(echo $SUBNETS | awk '{print $1}')
+            RT=$(route_table_for "$s")
+            [ "$RT" != "None" ] || { echo "::error::subnet $s has no route table"; exit 1; }
+            echo "No public subnet found - adding 0.0.0.0/0 -> $IGW to $RT"
+            # create-route errors if the route already exists, which is harmless here.
+            aws ec2 create-route --route-table-id "$RT" \
+              --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW" >/dev/null || true
+            has_igw_route "$RT" || {
+              echo "::error::could not make $s public. Fix by hand: VPC -> Route tables -> $RT -> Edit routes -> add 0.0.0.0/0 -> $IGW"
+              exit 1
+            }
+            SUBNET_ID="$s"
+          fi
 
           echo "vpc_id=$VPC_ID"       >> "$GITHUB_OUTPUT"
           echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
@@ -76,6 +150,7 @@ jobs:
               aws cloudformation wait stack-delete-complete --stack-name "$STACK"
               ;;
           esac
+
       - name: Deploy the server
         run: |
           set -euo pipefail
@@ -83,6 +158,7 @@ jobs:
           # keeps working after a fork or a rename.
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY#*/}"
+
           aws cloudformation deploy \
             --template-file "$TEMPLATE" \
             --stack-name '${{ steps.env.outputs.stack }}' \
@@ -104,14 +180,19 @@ jobs:
           aws cloudformation describe-stack-events --stack-name '${{ steps.env.outputs.stack }}' \
             --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`||ResourceStatus==`UPDATE_FAILED`].[Timestamp,LogicalResourceId,ResourceStatusReason])' \
             --output table || true
+
       - name: Read the server address
         id: out
         run: |
           set -euo pipefail
           IP=$(aws cloudformation describe-stacks --stack-name '${{ steps.env.outputs.stack }}' \
             --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text)
+          # Fail here rather than spending seven minutes polling an empty address.
+          [ -n "$IP" ] && [ "$IP" != "None" ] \
+            || { echo "::error::the stack produced no public IP"; exit 1; }
           echo "ip=$IP" >> "$GITHUB_OUTPUT"
           echo "Server: $IP"
+
       - name: Wait for the server to answer
         run: |
           set -uo pipefail
@@ -125,7 +206,15 @@ jobs:
             sleep 10
           done
           echo "::error::server did not answer within ~7 minutes"
+          # 000 forty times over means nothing answered at all: read the boot log in
+          # EC2 -> Instances -> Actions -> Monitor and troubleshoot -> Get system log.
+          aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=${{ steps.env.outputs.name }}-web-server \
+                      Name=instance-state-name,Values=running,pending \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,SubnetId]' \
+            --output table || true
           exit 1
+
       - name: Push this commit to the server
         env:
           SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
@@ -135,6 +224,7 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/lab.pem
           chmod 600 ~/.ssh/lab.pem
+
           # The commit sha, not the branch name: this pins the page to exactly the code
           # that triggered the run, not to whatever the branch points at a minute later.
           n=0
@@ -154,6 +244,7 @@ jobs:
           echo "$PAGE" | grep -q "$SHORT" \
             && echo "Live version is $SHORT" \
             || echo "Warning: the page does not show $SHORT"
+
       - name: Summary
         run: |
           {
